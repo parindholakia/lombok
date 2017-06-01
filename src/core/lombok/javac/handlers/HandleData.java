@@ -22,6 +22,7 @@
 package lombok.javac.handlers;
 
 import static lombok.core.handlers.HandlerUtil.*;
+import static lombok.javac.Javac.CTC_INT;
 import static lombok.javac.handlers.JavacHandlerUtil.*;
 
 import java.lang.reflect.Modifier;
@@ -32,6 +33,7 @@ import lombok.ConfigurationKeys;
 import lombok.Data;
 import lombok.core.AST.Kind;
 import lombok.core.AnnotationValues;
+import lombok.javac.Javac;
 import lombok.javac.JavacAnnotationHandler;
 import lombok.javac.JavacNode;
 import lombok.javac.JavacTreeMaker;
@@ -40,6 +42,7 @@ import lombok.javac.handlers.HandleConstructor.SkipIfConstructorExists;
 import org.mangosdk.spi.ProviderFor;
 
 import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.resources.javac;
 import com.sun.tools.javac.tree.JCTree;
 import com.sun.tools.javac.tree.JCTree.JCAnnotation;
 import com.sun.tools.javac.tree.JCTree.JCAssign;
@@ -47,9 +50,11 @@ import com.sun.tools.javac.tree.JCTree.JCBlock;
 import com.sun.tools.javac.tree.JCTree.JCClassDecl;
 import com.sun.tools.javac.tree.JCTree.JCExpression;
 import com.sun.tools.javac.tree.JCTree.JCMethodDecl;
+import com.sun.tools.javac.tree.JCTree.JCMethodInvocation;
 import com.sun.tools.javac.tree.JCTree.JCModifiers;
 import com.sun.tools.javac.tree.JCTree.JCNewClass;
 import com.sun.tools.javac.tree.JCTree.JCStatement;
+import com.sun.tools.javac.tree.JCTree.JCTypeParameter;
 import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
 import com.sun.tools.javac.util.List;
 import com.sun.tools.javac.util.ListBuffer;
@@ -80,11 +85,12 @@ public class HandleData extends JavacAnnotationHandler<Data> {
 		new HandleSetter().generateSetterForType(typeNode, annotationNode, AccessLevel.PUBLIC, true);
 		new HandleEqualsAndHashCode().generateEqualsAndHashCodeForType(typeNode, annotationNode);
 		new HandleToString().generateToStringForType(typeNode, annotationNode);
+		handleParseResultSet(typeNode, annotationNode);
 	}
 public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
 		
 		ListBuffer<JavacNode> columnList=new ListBuffer<JavacNode>();
-				columnList=null;		
+						
 				for (JavacNode field : typeNode.down()) {
 					if (field.getKind() != Kind.FIELD) continue;
 					if(hasAnnotation(Column.class, field))
@@ -93,13 +99,14 @@ public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
 				if(columnList.isEmpty())
 					return;
 				
-				switch(methodExists("parseResultSet",typeNode,1)){
+				switch(methodExists("mapRow",typeNode,1)){
 				case EXISTS_BY_LOMBOK:
 				case EXISTS_BY_USER:
 					break;
 				case NOT_EXISTS:
 					List<JavacNode> columnTypeList=columnList.toList();
-					
+					JCMethodDecl method=createJDBCParser(typeNode,columnTypeList ,errorNode.get());
+					injectMethod(typeNode, method);
 					break;
 				default:
 					break;
@@ -110,47 +117,50 @@ public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
 	}
 private JCMethodDecl createJDBCParser(JavacNode typeNode,List<JavacNode> fields,JCTree source){
 	JavacTreeMaker 			maker 					= 	typeNode.getTreeMaker();
-	JCModifiers   			publicStatic 			= 	maker.Modifiers(Modifier.PUBLIC+Modifier.STATIC);
-	JCExpression  			returnType 				= 	getClassType(typeNode);
+	Name					resultSetObject			=   typeNode.toName("resultSet")
+;	JCModifiers   			publicStatic 			= 	maker.Modifiers(Modifier.PUBLIC);
+	JCExpression  			returnType 				= 	genTypeRef(typeNode,typeNode.getName());
 	Name 					methodName				= 	typeNode.toName("mapRow");
 	List<JCVariableDecl>  	methodParameters   		= 	List.of(maker.
 			  											VarDef(maker.Modifiers(Flags.PARAMETER)
-  															   ,typeNode.toName("resultSet")
+  															   ,resultSetObject
 															   	   ,genTypeRef(typeNode,"java.sql.ResultSet")
 													   	   	  ,null));
 	List<JCExpression>    	methodThrows       		= 	List.of(genJavaLangTypeRef(typeNode,"Exception"));
 	
-	List<JCExpression> 		jceBlank 				= 	List.nil();
-	JCExpression			dataInstance			=	maker.NewClass(null,jceBlank, returnType, null, null);
-	JCVariableDecl			dataVar					=   maker.VarDef(maker.Modifiers(Flags.LocalVarFlags),typeNode.toName("dataObject"),returnType, null);
-    JCAssign				objAssign				= 	maker.Assign(dataVar.init, dataInstance);
-	JCStatement 			returnStatement			=	maker.Return(dataVar.init);
+    Name					objectName				= 	typeNode.toName("dataObject");
     
-	ListBuffer<JCStatement> statementList=new ListBuffer<JCTree.JCStatement>();
-    statementList.append(maker.Exec(objAssign));
-    statementList.append(returnStatement);
+	ListBuffer<JCStatement> statements=new ListBuffer<JCTree.JCStatement>();
+	
+	/*MyClass dataObject=new MyClass();*/
+	statements.append(maker.VarDef(maker.Modifiers(0)
+			,objectName
+			,returnType
+			,maker.NewClass(null, List.<JCExpression>nil(),returnType,List.<JCExpression>nil(), null)));
     
-    JCBlock block= maker.Block(0l, statementList.toList());
+	
+//	JCMethodInvocation resultsetNext=maker.Apply(List.<JCExpression>nil(),
+//			maker.Select(maker.Ident(resultSetObject), typeNode.toName("next")),
+//			List.<JCExpression>nil());
+//	statements.append(maker.Exec(resultsetNext));
+	
+	statements.append(maker.Return(maker.Ident(objectName)));
+	
+    JCBlock body = maker.Block(0, statements.toList());
+   
     return recursiveSetGeneratedBy(maker.MethodDef(
 		    publicStatic, 
 		    methodName, 
 		    returnType,
-		    null, 
+		    List.<JCTypeParameter>nil(), 
 		    methodParameters, 
 		    methodThrows, 
-		    block, 
-		    null 
+		    body, 
+		    null
 		   ), source,typeNode.getContext());
     
     
 
-}
-
-private JCExpression getClassType(JavacNode typeNode){
-	JavacTreeMaker maker = typeNode.getTreeMaker();
-	JCClassDecl typeClass=(JCClassDecl) typeNode.get();
-	return maker.Type(typeClass.type);
-	
 }
 
 }
