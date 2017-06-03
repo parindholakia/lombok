@@ -37,16 +37,21 @@ import lombok.javac.Javac;
 import lombok.javac.JavacAnnotationHandler;
 import lombok.javac.JavacNode;
 import lombok.javac.JavacTreeMaker;
+import lombok.javac.JavacTreeMaker.TypeTag;
 import lombok.javac.handlers.HandleConstructor.SkipIfConstructorExists;
 
+import org.eclipse.jdt.internal.ui.javadocexport.JavadocConsoleLineTracker;
 import org.mangosdk.spi.ProviderFor;
 
 import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.code.Type;
+import com.sun.tools.javac.code.TypeTags;
 import com.sun.tools.javac.resources.javac;
 import com.sun.tools.javac.tree.JCTree;
 import com.sun.tools.javac.tree.JCTree.JCAnnotation;
 import com.sun.tools.javac.tree.JCTree.JCAssign;
 import com.sun.tools.javac.tree.JCTree.JCBlock;
+import com.sun.tools.javac.tree.JCTree.JCCatch;
 import com.sun.tools.javac.tree.JCTree.JCClassDecl;
 import com.sun.tools.javac.tree.JCTree.JCExpression;
 import com.sun.tools.javac.tree.JCTree.JCMethodDecl;
@@ -54,8 +59,10 @@ import com.sun.tools.javac.tree.JCTree.JCMethodInvocation;
 import com.sun.tools.javac.tree.JCTree.JCModifiers;
 import com.sun.tools.javac.tree.JCTree.JCNewClass;
 import com.sun.tools.javac.tree.JCTree.JCStatement;
+import com.sun.tools.javac.tree.JCTree.JCTry;
 import com.sun.tools.javac.tree.JCTree.JCTypeParameter;
 import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
+import com.sun.tools.javac.tree.TreeMaker;
 import com.sun.tools.javac.util.List;
 import com.sun.tools.javac.util.ListBuffer;
 import com.sun.tools.javac.util.Name;
@@ -90,11 +97,18 @@ public class HandleData extends JavacAnnotationHandler<Data> {
 public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
 		
 		ListBuffer<JavacNode> columnList=new ListBuffer<JavacNode>();
+		ListBuffer<String>    columnNames=new ListBuffer<String>();
 						
 				for (JavacNode field : typeNode.down()) {
 					if (field.getKind() != Kind.FIELD) continue;
-					if(hasAnnotation(Column.class, field))
-						columnList.append(field);				
+					JavacNode annotation=findAnnotation(Column.class, field,false);
+					if(annotation!=null){
+						Column columnInstance=createAnnotation(Column.class,annotation).getInstance();
+						columnNames.append(columnInstance.value());
+						columnList.append(field);	
+				
+					}
+									
 				}		
 				if(columnList.isEmpty())
 					return;
@@ -105,7 +119,8 @@ public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
 					break;
 				case NOT_EXISTS:
 					List<JavacNode> columnTypeList=columnList.toList();
-					JCMethodDecl method=createJDBCParser(typeNode,columnTypeList ,errorNode.get());
+					List<String> columnNameList=columnNames.toList();
+					JCMethodDecl method=createJDBCParser(typeNode,columnTypeList,columnNameList,errorNode.get());
 					injectMethod(typeNode, method);
 					break;
 				default:
@@ -115,7 +130,7 @@ public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
 				
 				
 	}
-private JCMethodDecl createJDBCParser(JavacNode typeNode,List<JavacNode> fields,JCTree source){
+private JCMethodDecl createJDBCParser(JavacNode typeNode,List<JavacNode> fields,List<String> columnNames,JCTree source){
 	JavacTreeMaker 			maker 					= 	typeNode.getTreeMaker();
 	Name					resultSetObject			=   typeNode.toName("resultSet")
 ;	JCModifiers   			publicStatic 			= 	maker.Modifiers(Modifier.PUBLIC);
@@ -138,11 +153,13 @@ private JCMethodDecl createJDBCParser(JavacNode typeNode,List<JavacNode> fields,
 			,returnType
 			,maker.NewClass(null, List.<JCExpression>nil(),returnType,List.<JCExpression>nil(), null)));
     
-	
-//	JCMethodInvocation resultsetNext=maker.Apply(List.<JCExpression>nil(),
-//			maker.Select(maker.Ident(resultSetObject), typeNode.toName("next")),
-//			List.<JCExpression>nil());
-//	statements.append(maker.Exec(resultsetNext));
+	JCCatch catchStatement=createCatchBlock(source, maker, typeNode);
+	List<JCCatch>  catchList=List.<JCCatch>of(catchStatement);
+	for(int i=0;i<fields.size();i++){
+		JCTry tryBlock=maker.Try(createAccessorBlock(objectName, 
+				resultSetObject, maker,fields.get(i),columnNames.get(i)),catchList, null);
+		statements.append(tryBlock);
+	}
 	
 	statements.append(maker.Return(maker.Ident(objectName)));
 	
@@ -162,5 +179,55 @@ private JCMethodDecl createJDBCParser(JavacNode typeNode,List<JavacNode> fields,
     
 
 }
+
+private JCBlock createAccessorBlock(Name dataObject,Name resultSetName,JavacTreeMaker maker,JavacNode node,String columnName){
+	
+	JCVariableDecl declaredVar=(JCVariableDecl)node.get();
+	JCExpression varType=declaredVar.vartype;
+	
+	String setterName=toSetterName(node);
+	String resultSetMethodName=getResultSetMethodName(varType);
+	
+	
+	JCMethodInvocation resultsetMethod=maker.Apply(List.<JCExpression>nil(),
+	maker.Select(maker.Ident(resultSetName), node.toName(resultSetMethodName)),
+	List.<JCExpression>of(maker.Literal(columnName)));
+	
+	JCMethodInvocation setterMethodInvocation=maker.Apply(List.<JCExpression>nil(),
+			maker.Select(maker.Ident(dataObject),node.toName(setterName)),
+			List.<JCExpression>of(resultsetMethod));
+	JCBlock block= maker.Block(0, List.<JCStatement>of(maker.Exec(setterMethodInvocation)));
+	return block;
+}
+private String getResultSetMethodName(JCExpression varType){
+	String methodName=null;
+	String vartypeString=varType.toString().toLowerCase();
+	if(vartypeString.equals("boolean"))
+		methodName="getString";
+	if(vartypeString.contains("string"))
+		methodName="getString";
+	if(vartypeString.equals("long"))
+		methodName="getLong";
+	if(vartypeString.equals("int"))
+		methodName="getInt";
+	if(vartypeString.equals("float"))
+		methodName="getFloat";
+	if(vartypeString.equals("double"))
+		methodName="getDouble";
+	return methodName;
+	
+	
+		
+	
+}
+private JCCatch createCatchBlock(JCTree source,JavacTreeMaker maker,JavacNode typeNode){
+	JCExpression 				varType 			=	genTypeRef(typeNode,"NullPointerException");
+	JCVariableDecl				catchParam			=	maker.VarDef(maker.Modifiers(Flags.PARAMETER), typeNode.toName("ex"), varType, null);
+	JCBlock 					catchBlock			=   maker.Block(0, List.<JCStatement>nil());
+	JCCatch						catchStatement		= 	maker.Catch(catchParam, catchBlock);
+	return recursiveSetGeneratedBy(catchStatement, source, typeNode.getContext());
+}
+
+
 
 }
