@@ -39,6 +39,7 @@ import lombok.javac.JavacNode;
 import lombok.javac.JavacTreeMaker;
 import lombok.javac.JavacTreeMaker.TypeTag;
 import lombok.javac.handlers.HandleConstructor.SkipIfConstructorExists;
+import lombok.javac.handlers.JavacHandlerUtil.FieldAccess;
 
 import org.eclipse.jdt.internal.ui.javadocexport.JavadocConsoleLineTracker;
 import org.mangosdk.spi.ProviderFor;
@@ -79,10 +80,14 @@ public class HandleData extends JavacAnnotationHandler<Data> {
 		JavacNode typeNode = annotationNode.up();
 		boolean notAClass = !isClass(typeNode);
 		
+		
+		
 		if (notAClass) {
 			annotationNode.addError("@Data is only supported on a class.");
 			return;
 		}
+		
+		Boolean callSuper = annotation.getInstance().callSuper();
 		
 		String staticConstructorName = annotation.getInstance().staticConstructor();
 		
@@ -92,10 +97,30 @@ public class HandleData extends JavacAnnotationHandler<Data> {
 		new HandleSetter().generateSetterForType(typeNode, annotationNode, AccessLevel.PUBLIC, true);
 		new HandleEqualsAndHashCode().generateEqualsAndHashCodeForType(typeNode, annotationNode);
 		new HandleToString().generateToStringForType(typeNode, annotationNode);
-		handleParseResultSet(typeNode, annotationNode);
-	}
-public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
+		handleParseResultSet(callSuper,typeNode, annotationNode);
 		
+	}
+	
+
+
+	
+private boolean isNotValidCallToSuper(JavacNode typeNode){
+	JCTree extending = Javac.getExtendsClause((JCClassDecl)typeNode.get());
+	boolean isDirectDescendantOfObject=true;
+	if (extending != null) {
+		String p = extending.toString();
+		isDirectDescendantOfObject = p.equals("Object") || p.equals("java.lang.Object");
+	}
+	return isDirectDescendantOfObject;
+	
+	
+}
+public void handleParseResultSet(boolean callSuper,JavacNode typeNode,JavacNode errorNode){
+	
+	if (callSuper && isNotValidCallToSuper(typeNode)) {
+		errorNode.addError("Generating parser Method with a supercall to java.lang.Object is pointless.");
+		return;
+	}
 		ListBuffer<JavacNode> columnList=new ListBuffer<JavacNode>();
 		ListBuffer<String>    columnNames=new ListBuffer<String>();
 						
@@ -122,6 +147,9 @@ public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
 					List<String> columnNameList=columnNames.toList();
 					JCMethodDecl method=createJDBCParser(typeNode,columnTypeList,columnNameList,errorNode.get());
 					injectMethod(typeNode, method);
+					
+					JCMethodDecl constructorMethod=createConstructor(callSuper, typeNode, errorNode.get());
+					injectMethod(typeNode, constructorMethod);
 					break;
 				default:
 					break;
@@ -130,11 +158,56 @@ public void handleParseResultSet(JavacNode typeNode,JavacNode errorNode){
 				
 				
 	}
+private JCMethodDecl createConstructor(boolean callSuper,JavacNode typeNode,JCTree source){
+
+	JavacTreeMaker 			maker 					= 	typeNode.getTreeMaker();
+	Name					resultSetObject			=   typeNode.toName("resultSet");	
+	JCModifiers 			mods 					= 	maker.Modifiers(toJavacModifier(AccessLevel.PUBLIC), List.<JCAnnotation>nil());
+	List<JCVariableDecl>  	methodParameters   		= 	List.of(maker.
+			  											VarDef(maker.Modifiers(Flags.PARAMETER)
+  															   ,resultSetObject
+															   	   ,genTypeRef(typeNode,"java.sql.ResultSet")
+													   	   	  ,null));
+	List<JCExpression>    	methodThrows       		= 	List.of(genJavaLangTypeRef(typeNode,"Exception"));
+	
+	
+	
+    
+	ListBuffer<JCStatement> statements=new ListBuffer<JCTree.JCStatement>();
+	
+	
+	
+	JCMethodInvocation superMethod=null;
+	
+	if(callSuper){
+		
+		superMethod=maker.Apply(List.<JCExpression>nil(),maker.Ident(typeNode.toName("super"))
+				,List.<JCExpression>of(maker.Ident(typeNode.toName("resultSet"))));
+		statements.append(maker.Exec(superMethod));
+	}
+	superMethod=maker.Apply(List.<JCExpression>nil(),
+			maker.Select(maker.Ident(typeNode.toName("this")), typeNode.toName("mapRow")),
+			List.<JCExpression>of(maker.Ident(typeNode.toName("resultSet"))));
+	statements.append(maker.Exec(superMethod));
+	
+	JCBlock body = maker.Block(0,statements.toList());
+
+	 return recursiveSetGeneratedBy(maker.MethodDef(
+			    mods, 
+			    typeNode.toName("<init>"), 
+			    null,
+			    List.<JCTypeParameter>nil(), 
+			    methodParameters, 
+			    methodThrows, 
+			    body, 
+			    null
+			   ), source,typeNode.getContext());
+}
 private JCMethodDecl createJDBCParser(JavacNode typeNode,List<JavacNode> fields,List<String> columnNames,JCTree source){
 	JavacTreeMaker 			maker 					= 	typeNode.getTreeMaker();
-	Name					resultSetObject			=   typeNode.toName("resultSet")
-;	JCModifiers   			publicStatic 			= 	maker.Modifiers(Modifier.PUBLIC);
-	JCExpression  			returnType 				= 	genTypeRef(typeNode,typeNode.getName());
+	Name					resultSetObject			=   typeNode.toName("resultSet");	
+	JCModifiers   			publicStatic 			= 	maker.Modifiers(Modifier.PRIVATE);
+	JCExpression			returnType					=	maker.TypeIdent(Javac.CTC_VOID);
 	Name 					methodName				= 	typeNode.toName("mapRow");
 	List<JCVariableDecl>  	methodParameters   		= 	List.of(maker.
 			  											VarDef(maker.Modifiers(Flags.PARAMETER)
@@ -143,15 +216,11 @@ private JCMethodDecl createJDBCParser(JavacNode typeNode,List<JavacNode> fields,
 													   	   	  ,null));
 	List<JCExpression>    	methodThrows       		= 	List.of(genJavaLangTypeRef(typeNode,"Exception"));
 	
-    Name					objectName				= 	typeNode.toName("dataObject");
+    Name					objectName				= 	typeNode.toName("this");
     
 	ListBuffer<JCStatement> statements=new ListBuffer<JCTree.JCStatement>();
 	
-	/*MyClass dataObject=new MyClass();*/
-	statements.append(maker.VarDef(maker.Modifiers(0)
-			,objectName
-			,returnType
-			,maker.NewClass(null, List.<JCExpression>nil(),returnType,List.<JCExpression>nil(), null)));
+	
     
 	JCCatch catchStatement=createCatchBlock(source, maker, typeNode);
 	List<JCCatch>  catchList=List.<JCCatch>of(catchStatement);
@@ -161,7 +230,7 @@ private JCMethodDecl createJDBCParser(JavacNode typeNode,List<JavacNode> fields,
 		statements.append(tryBlock);
 	}
 	
-	statements.append(maker.Return(maker.Ident(objectName)));
+	
 	
     JCBlock body = maker.Block(0, statements.toList());
    
